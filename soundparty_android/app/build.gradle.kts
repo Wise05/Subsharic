@@ -1,7 +1,20 @@
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.2.10"
+}
+
+val envProperties = Properties().apply {
+    val envFile = rootDir.parentFile.resolve(".env")
+    if (envFile.exists()) {
+        envFile.inputStream().use { load(it) }
+    }
+}
+val navidromeUrl: String = envProperties.getProperty("NAVIDROME_URL") ?: "http://100.65.130.65:4533"
+val syncBrokerUrl: String = envProperties.getProperty("SYNC_BROKER_URL") ?: run {
+    val host = navidromeUrl.substringAfter("://").substringBefore(":")
+    "ws://$host:3000/ws"
 }
 
 android {
@@ -16,10 +29,14 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "NAVIDROME_URL", "\"$navidromeUrl\"")
+        buildConfigField("String", "SYNC_BROKER_URL", "\"$syncBrokerUrl\"")
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     buildTypes {
@@ -72,4 +89,6 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

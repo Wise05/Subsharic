@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
-import { PlaybackState } from '../models/Room';
-import { RoomCommand } from '../models/Messages';
+import type { PlaybackState, QueueEntry } from '../models/Room.ts';
+import type { RoomCommand } from '../models/Messages.ts';
+import type { Track } from '../models/Track.ts';
 
 export interface RoomMember {
   clientId: string;
   socket: WebSocket;
+  /** Server time when this peer joined this room; reconnects start a new tenure. */
+  joinedAt: number;
 }
 
 export interface Room {
@@ -13,6 +16,7 @@ export interface Room {
   hostId: string;
   members: Map<string, RoomMember>;
   state: PlaybackState | null;
+  queue: QueueEntry[];
 }
 
 type ClientSocket = { clientId: string; socket: WebSocket };
@@ -21,6 +25,11 @@ type ClientSocket = { clientId: string; socket: WebSocket };
 export class RoomManager {
   private readonly rooms = new Map<string, Room>();
   private readonly roomByClient = new Map<string, string>();
+  private readonly now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
 
   handle(client: ClientSocket, command: RoomCommand): void {
     switch (command.type) {
@@ -36,6 +45,15 @@ export class RoomManager {
       case 'BROADCAST_STATE':
         this.broadcastState(client, command.state);
         return;
+      case 'ADD_TO_QUEUE':
+        this.addToQueue(client, command.track);
+        return;
+      case 'REMOVE_FROM_QUEUE':
+        this.removeFromQueue(client, command.queueId);
+        return;
+      case 'REORDER_QUEUE':
+        this.reorderQueue(client, command.queueIds);
+        return;
     }
   }
 
@@ -49,13 +67,14 @@ export class RoomManager {
     const room: Room = {
       id: randomUUID(),
       hostId: client.clientId,
-      members: new Map([[client.clientId, { ...client }]]),
+      members: new Map([[client.clientId, { ...client, joinedAt: this.now() }]]),
       state: null,
+      queue: [],
     };
     this.rooms.set(room.id, room);
     this.roomByClient.set(client.clientId, room.id);
 
-    this.send(client.socket, { type: 'ROOM_CREATED', roomId: room.id });
+    this.send(client.socket, { type: 'ROOM_CREATED', roomId: room.id, hostId: room.hostId, clientId: client.clientId, queue: room.queue });
   }
 
   private joinRoom(client: ClientSocket, roomId: string): void {
@@ -71,19 +90,23 @@ export class RoomManager {
         type: 'ROOM_JOINED',
         roomId: room.id,
         hostId: room.hostId,
+        clientId: client.clientId,
         state: room.state,
+        queue: room.queue,
       });
       return;
     }
     if (currentRoomId) this.leaveRoom(client.clientId);
 
-    room.members.set(client.clientId, { ...client });
+    room.members.set(client.clientId, { ...client, joinedAt: this.now() });
     this.roomByClient.set(client.clientId, room.id);
     this.send(client.socket, {
       type: 'ROOM_JOINED',
       roomId: room.id,
       hostId: room.hostId,
+      clientId: client.clientId,
       state: room.state,
+      queue: room.queue,
     });
     this.broadcast(room, {
       type: 'MEMBER_JOINED',
@@ -104,8 +127,8 @@ export class RoomManager {
     room.members.delete(clientId);
     if (member) this.send(member.socket, { type: 'ROOM_LEFT', roomId: room.id });
     if (room.hostId === clientId) {
-      const nextMember = room.members.keys().next().value as string | undefined;
-      if (nextMember) room.hostId = nextMember;
+      const nextMember = [...room.members.values()].sort((a, b) => a.joinedAt - b.joinedAt)[0];
+      if (nextMember) room.hostId = nextMember.clientId;
     }
     if (room.members.size === 0) {
       this.rooms.delete(room.id);
@@ -132,8 +155,65 @@ export class RoomManager {
       return;
     }
     
-    room.state = state;
-    this.broadcast(room, { type: 'STATE_UPDATED', roomId: room.id, state });
+    // updatedAt is a broker epoch timestamp paired with this playhead position.
+    // Never trust client wall clocks for the shared timeline anchor.
+    room.state = { ...state, updatedAt: this.now() };
+    this.broadcast(room, { type: 'STATE_UPDATED', roomId: room.id, state: room.state });
+  }
+
+  private addToQueue(client: ClientSocket, track: Track): void {
+    const room = this.getMemberRoom(client);
+    if (!room) return;
+    room.queue.push({ queueId: randomUUID(), track });
+    console.log(`Track added to room ${room.id}; queue now has ${room.queue.length} tracks`);
+    this.broadcast(room, { type: 'QUEUE_UPDATED', roomId: room.id, queue: room.queue });
+  }
+
+  private removeFromQueue(client: ClientSocket, queueId: string): void {
+    const room = this.getHostRoom(client);
+    if (!room) return;
+    const entryIndex = room.queue.findIndex((entry) => entry.queueId === queueId);
+    if (entryIndex < 0) {
+      this.sendError(client.socket, 'QUEUE_ENTRY_NOT_FOUND', 'That queue entry no longer exists.');
+      return;
+    }
+    room.queue.splice(entryIndex, 1);
+    this.broadcast(room, { type: 'QUEUE_UPDATED', roomId: room.id, queue: room.queue });
+  }
+
+  private reorderQueue(client: ClientSocket, queueIds: string[]): void {
+    const room = this.getHostRoom(client);
+    if (!room) return;
+    const currentIds = room.queue.map((entry) => entry.queueId);
+    if (queueIds.length !== currentIds.length
+      || new Set(queueIds).size !== currentIds.length
+      || currentIds.some((queueId) => !queueIds.includes(queueId))) {
+      this.sendError(client.socket, 'INVALID_QUEUE_ORDER', 'Queue order must contain every current entry exactly once.');
+      return;
+    }
+    const entriesById = new Map(room.queue.map((entry) => [entry.queueId, entry]));
+    room.queue = queueIds.map((queueId) => entriesById.get(queueId)!);
+    this.broadcast(room, { type: 'QUEUE_UPDATED', roomId: room.id, queue: room.queue });
+  }
+
+  private getMemberRoom(client: ClientSocket): Room | null {
+    const roomId = this.roomByClient.get(client.clientId);
+    const room = roomId ? this.rooms.get(roomId) : undefined;
+    if (!room || !room.members.has(client.clientId)) {
+      this.sendError(client.socket, 'NOT_IN_ROOM', 'Join a room before changing its queue.');
+      return null;
+    }
+    return room;
+  }
+
+  private getHostRoom(client: ClientSocket): Room | null {
+    const room = this.getMemberRoom(client);
+    if (!room) return null;
+    if (room.hostId !== client.clientId) {
+      this.sendError(client.socket, 'NOT_HOST', 'Only the host can reorder or remove queue entries.');
+      return null;
+    }
+    return room;
   }
 
   private broadcast(room: Room, payload: unknown, exceptClientId?: string): void {

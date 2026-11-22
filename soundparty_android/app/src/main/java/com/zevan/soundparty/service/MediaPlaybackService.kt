@@ -1,9 +1,13 @@
 package com.zevan.soundparty.service
 
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.media.AudioManager
+import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -12,6 +16,14 @@ class MediaPlaybackService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
     private lateinit var player: ExoPlayer
+    private lateinit var audioFocusHandler: AudioFocusHandler
+    private var noisyReceiverRegistered = false
+
+    private val becomingNoisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) player.pause()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -23,9 +35,18 @@ class MediaPlaybackService : MediaSessionService() {
             .build()
 
         player = ExoPlayer.Builder(this)
-            .setAudioAttributes(audioAttributes, true) // true handles audio focus automatically
-            .setHandleAudioBecomingNoisy(true)          // auto-pauses when headphones unplug
+            .setAudioAttributes(audioAttributes, false) // AudioFocusHandler owns focus policy.
+            .setHandleAudioBecomingNoisy(false)          // Register an explicit service receiver below.
             .build()
+
+        audioFocusHandler = AudioFocusHandler(this, player)
+        ContextCompat.registerReceiver(
+            this,
+            becomingNoisyReceiver,
+            IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        noisyReceiverRegistered = true
 
         // 2. Build the MediaSession wrapping ExoPlayer
         mediaSession = MediaSession.Builder(this, player).build()
@@ -37,6 +58,11 @@ class MediaPlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        if (noisyReceiverRegistered) {
+            unregisterReceiver(becomingNoisyReceiver)
+            noisyReceiverRegistered = false
+        }
+        if (::audioFocusHandler.isInitialized) audioFocusHandler.close()
         mediaSession?.run {
             player.release()
             release()
